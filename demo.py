@@ -34,7 +34,13 @@ mano = manolayer.ManoLayer(flat_hand_mean=True,
                            mano_root=_mano_root,
                            use_pca=False,
                            root_rot_mode='rotmat',
-                           joint_rot_mode='rotmat')
+                           joint_rot_mode='rotmat').to(device)
+
+mano_faces = mano.th_faces
+if torch.is_tensor(mano_faces):
+    mano_faces = mano_faces.detach().cpu().numpy()
+mano_faces = mano_faces.astype(np.int32)
+
 print('start opencv')
 point_fliter = smoother.OneEuroFilter(4.0, 0.0)
 mesh_fliter = smoother.OneEuroFilter(4.0, 0.0)
@@ -51,6 +57,10 @@ view_mat = np.array([[1.0, 0.0, 0.0],
                      [0.0, -1.0, 0],
                      [0.0, 0, -1.0]])
 mesh = open3d.geometry.TriangleMesh()
+# mano = mano.to(device) 
+pose0 = pose0.to(device)
+shape = shape.to(device)
+# hand_verts, j3d_recon = mano(pose0, shape)
 hand_verts, j3d_recon = mano(pose0, shape.float())
 mesh.triangles = open3d.utility.Vector3iVector(mano.th_faces)
 hand_verts = hand_verts.clone().detach().cpu().numpy()[0]

@@ -9,7 +9,7 @@ import torch
 sys.path.append("./")
 from torch import nn
 from einops import rearrange, repeat
-from model.helper import resnet50, conv3x3
+from model.helper import resnet50, conv3x3, conv1x1, Bottleneck
 import numpy as np
 
 
@@ -27,7 +27,6 @@ def get_pose_tile_torch(N):
     retv = torch.from_numpy(pos_tile).float()
     return rearrange(retv, 'b h w c -> b c h w')
 
-
 class net_2d(nn.Module):
     def __init__(self, input_features, output_features, stride, joints=21):
         super().__init__()
@@ -40,6 +39,68 @@ class net_2d(nn.Module):
         x = self.project(x)
         x = self.prediction(x).sigmoid()
         return x
+
+# class net_2d(nn.Module):
+#     def __init__(self, input_features, output_features, stride, blocks1=3, blocks2=3, joints=21, norm_layer=None):
+#         super().__init__()
+#         self._norm_layer = nn.BatchNorm2d if norm_layer is None else norm_layer
+#         self.dilation = 1
+#         self.groups = 1
+#         self.base_width = 64
+
+#         self.inplanes = input_features
+#         planes = max(1, output_features // Bottleneck.expansion) # Flooring 
+#         bottleneck_out = planes * Bottleneck.expansion
+
+#         # 两组bottleneck
+#         self.block1 = self._make_layer(Bottleneck, planes, blocks1, stride=2, 
+#                                        dilate=True)
+#         self.block2 = self._make_layer(Bottleneck, planes, blocks2, stride=2, 
+#                                        dilate=True)
+        
+#         # if output_features != bottleneck_out, 强行对齐with 1*1 conv
+#         if output_features != bottleneck_out:
+#             self.channel_adjust = nn.Sequential(
+#                 conv1x1(bottleneck_out, output_features, stride=1),
+#                 self._norm_layer(output_features),
+#                 nn.ReLU()
+#             )
+#         else:
+#             self.channel_adjust = nn.Identity()
+
+#         # final prediction head
+#         self.prediction = nn.Conv2d(output_features, joints, 1, 1, 0)
+
+#     def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+#         norm_layer = self._norm_layer
+#         downsample = None
+#         previous_dilation = self.dilation
+#         if dilate:
+#             self.dilation *= stride
+#             stride = 1
+#         if stride != 1 or self.inplanes != planes * block.expansion:
+#             downsample = nn.Sequential(
+#                 conv1x1(self.inplanes, planes * block.expansion, stride),
+#                 norm_layer(planes * block.expansion),
+#             )
+
+#         layers = []
+#         layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
+#                             self.base_width,self.dilation, norm_layer))
+#         self.inplanes = planes * block.expansion
+#         for _ in range(1, blocks):
+#             layers.append(block(self.inplanes, planes, groups=self.groups,
+#                                 base_width=self.base_width, dilation=self.dilation,
+#                                 norm_layer=norm_layer))
+
+#         return nn.Sequential(*layers)
+
+#     def forward(self, x):
+#         x = self.block1(x)
+#         x = self.block2(x)
+#         x = self.channel_adjust(x)
+#         x = self.prediction(x).sigmoid()
+#         return x
 
 
 class net_3d(nn.Module):

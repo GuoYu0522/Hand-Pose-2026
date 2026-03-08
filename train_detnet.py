@@ -172,7 +172,7 @@ def main(args):
                 'model': model,
             },
             checkpoint=args.checkpoint,
-            filename='{}.pth'.format(args.saved_prefix),
+            filename='{}.pth'.format(args.saved_prefix), # to do 在saved_prefix后面加参数配置
             snapshot=args.snapshot,
             is_best=[auc, best_acc]
         )
@@ -181,7 +181,7 @@ def main(args):
             if auc[key] > best_acc[key]:
                 best_acc[key] = auc[key]
 
-        misc.out_loss_auc(loss_all, auc_all, acc_hm_all, outpath=args.outpath)
+        misc.out_loss_auc(loss_all, auc_all, acc_hm_all, outpath=args.outpath) # to do
 
         scheduler.step()
 

@@ -32,7 +32,7 @@ class HandDataset(torch.utils.data.Dataset):
     def __init__(
             self,
             data_split='train',
-            data_root="/disk1/data",
+            data_root="..\data\dexter+object",
             subset_name=['rhd', 'stb'],
             hand_side='right',
             sigma=1.0,
