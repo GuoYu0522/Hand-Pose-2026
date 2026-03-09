@@ -1,6 +1,8 @@
 import argparse
 import os
 import time
+import json
+import csv
 
 import numpy as np
 import torch
@@ -22,8 +24,126 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cudnn.benchmark = True
 DEBUG = 0
 
+def list_to_str(x):
+    if isinstance(x, (list, tuple)):
+        return "-".join(map(str, x))
+    return str(x)
+
+
+def build_run_tag(args):
+    return (
+        f"lr{args.learning_rate}"
+        f"_tb{args.train_batch}"
+        f"_lres{list_to_str(args.layers_resnet)}"
+        f"_bp{list_to_str(args.block_planes_resnet)}"
+        f"_in{args.inplanes_resnet}"
+        f"_out{args.out_feature_dim_resnet}"
+        f"_hid{args.hidden_dim_detnet}"
+        f"_ln2d{list_to_str(args.layers_net2d)}"
+        f"_st{args.stacks}"
+        f"_ep{args.epochs}"
+        f"_g{args.gamma}"
+        f"_decay{args.lr_decay_step}"
+    )
+
+
+def prepare_experiment_dirs(args):
+    """
+    统一实验目录:
+        exp_dir/
+            checkpoints/
+            outputs/
+            metrics.json
+            metrics_row.csv
+            config.json
+    """
+    if args.exp_dir is None or str(args.exp_dir).strip() == "":
+        run_tag = build_run_tag(args)
+        args.run_name = args.run_name if args.run_name else run_tag
+        args.exp_dir = os.path.join("experiments", args.run_name)
+    else:
+        if args.run_name is None or str(args.run_name).strip() == "":
+            args.run_name = os.path.basename(os.path.normpath(args.exp_dir))
+
+    args.checkpoint = os.path.join(args.exp_dir, "checkpoints")
+    args.outpath = os.path.join(args.exp_dir, "outputs")
+
+    for path in [args.exp_dir, args.checkpoint, args.outpath]:
+        if not os.path.isdir(path):
+            os.makedirs(path)
+
+    # 若saved_prefix没显式设置成个性化名字，就自动加参数信息
+    if args.saved_prefix == "ckp_detnet":
+        #args.saved_prefix = f"ckp_detnet_{args.run_name}"
+        args.saved_prefix = f"ckp_detnet_{args.run_name[:30]}"
+
+def to_python(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.item()
+    return obj
+
+def save_config(args):
+    config_path = os.path.join(args.exp_dir, "config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=4, ensure_ascii=False)
+
+def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all):
+    metrics = {
+        "run_name": args.run_name,
+        "exp_dir": args.exp_dir,
+
+        "learning_rate": args.learning_rate,
+        "train_batch": args.train_batch,
+        "test_batch": args.test_batch,
+        "epochs": args.epochs,
+        "workers": args.workers,
+        "lr_decay_step": args.lr_decay_step,
+        "gamma": args.gamma,
+
+        "datasets_train": args.datasets_train,
+        "datasets_test": args.datasets_test,
+
+        "layers_resnet": args.layers_resnet,
+        "block_planes_resnet": args.block_planes_resnet,
+        "inplanes_resnet": args.inplanes_resnet,
+        "out_feature_dim_resnet": args.out_feature_dim_resnet,
+        "hidden_dim_detnet": args.hidden_dim_detnet,
+        "layers_net2d": args.layers_net2d,
+        "stacks": args.stacks,
+
+        "final_lossH": loss_all["lossH"][-1] if len(loss_all["lossH"]) > 0 else None,
+        "final_lossD": loss_all["lossD"][-1] if len(loss_all["lossD"]) > 0 else None,
+        "final_lossL": loss_all["lossL"][-1] if len(loss_all["lossL"]) > 0 else None,
+    }
+
+    for key in args.datasets_test:
+        metrics[f"best_auc_{key}"] = to_python(best_acc.get(key, None))
+
+        if key in auc_all and len(auc_all[key]) > 0:
+            metrics[f"last_auc_{key}"] = to_python(auc_all[key][-1][1])
+        else:
+            metrics[f"last_auc_{key}"] = None
+
+        if key in acc_hm_all and len(acc_hm_all[key]) > 0:
+            metrics[f"last_acc_hm_{key}"] = to_python(acc_hm_all[key][-1][1])
+        else:
+            metrics[f"last_acc_hm_{key}"] = None
+
+    metrics_json_path = os.path.join(args.exp_dir, "metrics.json")
+    with open(metrics_json_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=4, ensure_ascii=False)
+
+    metrics_csv_path = os.path.join(args.exp_dir, "metrics_row.csv")
+    with open(metrics_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
+        writer.writeheader()
+        writer.writerow(metrics)
+
 
 def main(args):
+    prepare_experiment_dirs(args)
+    save_config(args)
+
     for path in [args.checkpoint, args.outpath]:
         if not os.path.isdir(path):
             os.makedirs(path)
@@ -31,7 +151,15 @@ def main(args):
     misc.print_args(args)
 
     print("\nCREATE NETWORK")
-    model = detnet()
+    model = detnet(
+        layers_resnet=args.layers_resnet,
+        block_planes_resnet=args.block_planes_resnet,
+        inplanes_resnet=args.inplanes_resnet,
+        out_feature_dim_resnet=args.out_feature_dim_resnet,
+        hidden_dim_detnet=args.hidden_dim_detnet,
+        layers_net2d=args.layers_net2d,
+        stacks=args.stacks
+    )
     model.to(device)
 
     # define loss function (criterion) and optimizer
@@ -149,9 +277,13 @@ def main(args):
 
     for epoch in range(args.start_epoch, args.epochs + 1):
         print('\nEpoch: %d' % (epoch + 1))
+        
         for i in range(len(optimizer.param_groups)):
             print('group %d lr:' % i, optimizer.param_groups[i]['lr'])
         #############  trian for one epoch  ###############
+        print("Before Training")
+        print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
+        print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
         train(
             train_loader,
             model,
@@ -161,11 +293,20 @@ def main(args):
         )
         ##################################################
         auc = best_acc.copy() # need to deepcopy it because it's a dict
+        print("Before Validating")
+        print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
+        print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
         for key, value in test_loader_dic.items():
+            i = 0
+            print(f"{i}th: key={key}, value={value}")
             auc[key], acc_hm[key] = validate(value, model, criterion, key, args=args)
             auc_all[key].append([epoch + 1, auc[key]])
             acc_hm_all[key].append([epoch + 1, acc_hm[key]])
+            i = i+1
 
+        print("After Validating, Before Save Checkpoints")
+        print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
+        print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
         misc.save_checkpoint(
             {
                 'epoch': epoch + 1,
@@ -177,6 +318,10 @@ def main(args):
             is_best=[auc, best_acc]
         )
 
+        print("After Save Checkpoints")
+        print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
+        print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
+
         for key, value in test_loader_dic.items():
             if auc[key] > best_acc[key]:
                 best_acc[key] = auc[key]
@@ -184,6 +329,8 @@ def main(args):
         misc.out_loss_auc(loss_all, auc_all, acc_hm_all, outpath=args.outpath) # to do
 
         scheduler.step()
+
+    save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all)
 
     return 0  # end of main
 
@@ -397,7 +544,7 @@ if __name__ == '__main__':
         '-dr',
         '--data_root',
         type=str,
-        default="/home/chen/datasets/",
+        default="data",
         help='dataset root directory'
     )
     parser.add_argument(
@@ -444,6 +591,20 @@ if __name__ == '__main__':
         type=str,
         metavar='PATH',
         help='path to out_testset loss and auc (default: out_testset)'
+    )
+
+    parser.add_argument(
+        '--run_name',
+        default='',
+        type=str,
+        help='name of current experiment run'
+    )
+
+    parser.add_argument(
+        '--exp_dir',
+        default='',
+        type=str,
+        help='root directory of current experiment'
     )
 
     parser.add_argument(
@@ -541,6 +702,52 @@ if __name__ == '__main__':
         action='store_true',
         help='Calculate detnet loss',
         default=True
+    )
+    # detnet hyperparameters
+    parser.add_argument(
+        '--layers_resnet',
+        nargs='+',
+        type=int,
+        default=[2, 4, 6],
+        help='detnet: layers_resnet'
+    )
+    parser.add_argument(
+        '--block_planes_resnet',
+        nargs='+',
+        type=int,
+        default=[64, 128, 256],
+        help='detnet: block_planes_resnet'
+    )
+    parser.add_argument(
+        '--inplanes_resnet',
+        type=int,
+        default=64,
+        help='detnet: inplanes_resnet'
+    )
+    parser.add_argument(
+        '--out_feature_dim_resnet',
+        type=int,
+        default=256,
+        help='detnet: out_feature_dim_resnet'
+    )
+    parser.add_argument(
+        '--hidden_dim_detnet',
+        type=int,
+        default=256,
+        help='detnet: hidden_dim_detnet'
+    )
+    parser.add_argument(
+        '--layers_net2d',
+        nargs='+',
+        type=int,
+        default=[3, 3],
+        help='detnet: layers_net2d'
+    )
+    parser.add_argument(
+        '--stacks',
+        type=int,
+        default=1,
+        help='detnet: stacks'
     )
 
     main(parser.parse_args())

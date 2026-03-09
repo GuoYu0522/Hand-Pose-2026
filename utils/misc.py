@@ -62,9 +62,17 @@ def save_checkpoint(
 ):
     # preds = to_numpy(preds)
     filepath = os.path.join(checkpoint, filename)
-    fileprefix = filename.split('.')[0]
-    # torch.save(state, filepath)
-    torch.save(state['model'].state_dict(), filepath)
+    # fileprefix = filename.split('.')[0]
+    fileprefix = os.path.splitext(filename)[0]
+    print("ckpt dir:",checkpoint)
+    print("save filepath:",filepath)
+    print("filepath length:",len(filepath))
+    # torch.save(state['model'].state_dict(), filepath)
+    save_obj = {
+        'epoch':state['epoch'],
+        'state_dict': state['model'].module.state_dict() if isinstance(state['model'], torch.nn.DataParallel) else state['model'].state_dict(),
+    }
+    torch.save(save_obj, filepath)
 
     if snapshot and state['epoch'] % snapshot == 0:
         shutil.copyfile(
@@ -117,6 +125,8 @@ def load_checkpoint(model, checkpoint):
     model_state.update(state)
     model.load_state_dict(model_state)
     print(colored('loaded {}'.format(name), 'cyan'))
+    state_dict = torch.load(...)
+    model.load_state_dict(state_dict['state_dict'])
 
 
 def clean_state_dict(state_dict):

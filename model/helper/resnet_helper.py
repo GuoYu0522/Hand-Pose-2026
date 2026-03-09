@@ -106,7 +106,7 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False,
+    def __init__(self, block, layers, block_planes=[64, 128, 256], inplanes=64, out_feature_dim=256, num_classes=1000, zero_init_residual=False,
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None):
         super(ResNet, self).__init__()
@@ -114,7 +114,7 @@ class ResNet(nn.Module):
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
-        self.inplanes = 64
+        self.inplanes = inplanes
         self.dilation = 1
         if replace_stride_with_dilation is None:
             # each element in the tuple indicates if we should replace
@@ -130,17 +130,33 @@ class ResNet(nn.Module):
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
 
+        ## check and config block_planes
+        if block_planes is None:
+            raise ValueError("In a ResNet used as a feature extractor, block_planes, which is supposed to be a valid list, cannot be None.")
 
+        if len(layers) != len(block_planes):
+            raise ValueError("In a ResNet used as a feature extractor, layers and block_planes must have the same length.")
 
-        self.block1 = self._make_layer(block, 64, layers[0],stride =1)
-        self.pool = self.__sample(block,64,1,stride=2)
+        if len(layers) < 2:
+            raise ValueError("In a ResNet used as a feature extractor, there must be at least 2 bottleneck-based blocks.")
 
-        self.block2 = self._make_layer(block, 128, layers[1], stride=2,
-                                       dilate=True)
-        self.block3 = self._make_layer(block, 256, layers[2], stride=2,
-                                       dilate=True)
-        
-        self.squeeze = nn.Sequential(conv3x3(1024,256),nn.BatchNorm2d(256),nn.ReLU())
+        ## adaptive bottleneck stack
+        self.blocks = nn.ModuleList()
+
+        # 第一个block
+        self.blocks.append(self._make_layer(block, block_planes[0], layers[0], stride=1))
+
+        # pool在第一个block后（维持原有范式）
+        self.pool = self.__sample(block, block_planes[0], 1, stride=2)
+
+        # 后续block
+        for i in range(1, len(layers)):
+            self.blocks.append(
+                self._make_layer(block, block_planes[i], layers[i], stride=2, dilate=True)
+            )
+
+        last_block_out_channels = block_planes[-1] * block.expansion
+        self.squeeze = nn.Sequential(conv3x3(last_block_out_channels, out_feature_dim), nn.BatchNorm2d(out_feature_dim), nn.ReLU())
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -172,7 +188,7 @@ class ResNet(nn.Module):
                 norm_layer(planes * block.expansion),
             )
 
-        
+
         layers = []
         layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
                             self.base_width,self.dilation, norm_layer))
@@ -205,12 +221,12 @@ class ResNet(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.block1(x)
+
+        x = self.blocks[0](x)
         x = self.pool(x)
+        for i in range(1, len(self.blocks)):
+            x = self.blocks[i](x)
 
-        x = self.block2(x)
-
-        x = self.block3(x)
         x = self.squeeze(x)
         return x
 
@@ -247,7 +263,7 @@ def resnet34(pretrained=False, progress=True, **kwargs):
                    **kwargs)
 
 
-def resnet50(pretrained=False, progress=True, **kwargs):
+def resnet50(layers=[2, 4, 6], pretrained=False, progress=True, **kwargs):
     r"""ResNet-50 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
 
@@ -255,7 +271,7 @@ def resnet50(pretrained=False, progress=True, **kwargs):
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _resnet('resnet50', Bottleneck, [2, 4, 6], pretrained, progress,
+    return _resnet('resnet50', Bottleneck, layers, pretrained, progress,
                    **kwargs)
 
 
@@ -307,7 +323,7 @@ def load_model_from_tensorflow():
         'block1.0.shortcut.bn.weight':'block1.0.shortcut.1.weight',
         'block1.0.shortcut.bn.running_mean':'block1.0.shortcut.1.running_mean',
         'block1.0.shortcut.bn.running_var':'block1.0.shortcut.1.running_var'
-    
+
     }
 
     block_2_shortcut_map = {
@@ -333,20 +349,20 @@ def load_model_from_tensorflow():
     }
 
 
-    import os 
+    import os
     detnet_static_infos = {}
-    
+
     for key in keys:
         if 'Adam' not in key:
             if 'resnet' not in key:
                 continue
-            
+
             transfer_key = key.split('resnet/')[-1]
             if 'unit' in transfer_key:
                 transfer_key = transfer_key.replace('unit','').split('/')
                 transfer_key[1] = str(int(transfer_key[1])-1)
                 transfer_key = os.path.join(*transfer_key)
-            
+
             transfer_key = transfer_key.replace('/','.')
             transfer_key = transfer_key.replace('moving_mean','running_mean').replace('moving_variance','running_var')
             transfer_key = transfer_key.replace('gamma','weight').replace('beta','bias').replace('batch_normalization','bn')
@@ -404,7 +420,7 @@ def load_model_from_tensorflow():
 
 if __name__ == '__main__':
 
-    import numpy as np 
+    import numpy as np
     inp  = np.load("./input.npy")
     output = np.load('./output.npy')
     output = torch.from_numpy(output)
@@ -417,7 +433,7 @@ if __name__ == '__main__':
     inp = rearrange(inp,'b h w c -> b c h w')
 
     model = resnet50()
-    model_params = model.state_dict() 
+    model_params = model.state_dict()
     model  = model.eval()
 
     # r = model(inp)
@@ -425,7 +441,7 @@ if __name__ == '__main__':
 
 
 
-    torch_keys = sorted(model_params.keys())  
+    torch_keys = sorted(model_params.keys())
     remain_torch_keys = []
     for key in torch_keys:
         if 'num_batches_tracked' not in key:
@@ -443,6 +459,12 @@ if __name__ == '__main__':
     b,c,w,h = model(inp).shape
     loss  = model(inp)-output
     print(torch.max(loss),torch.sum(loss), torch.sum(loss)/(b*c*w*h))
+
+
+
+
+
+
 
 
     
