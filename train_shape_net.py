@@ -239,7 +239,7 @@ def one_forward_pass(metas, model, criterion, args, train=True):
     results = model(rel_bone_len)
     ''' ----------------  Forward End   ---------------- '''
 
-    total_loss = torch.Tensor([0]).cuda()
+    total_loss = torch.zeros(1, device=device)
     losses = {}
     if not train:
         return results, targets, total_loss, losses

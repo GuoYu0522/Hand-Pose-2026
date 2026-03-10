@@ -9,6 +9,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from progress.bar import Bar
 from tqdm import tqdm
+import gc
 
 import losses as losses
 import utils.misc as misc
@@ -23,6 +24,14 @@ from utils.eval.zimeval import EvalUtil
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cudnn.benchmark = True
 DEBUG = 0
+
+def cleanup():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
 
 def list_to_str(x):
     if isinstance(x, (list, tuple)):
@@ -332,6 +341,19 @@ def main(args):
 
     save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all)
 
+    del model
+    del optimizer
+    del scheduler
+    del train_loader
+    del train_dataset
+    del test_loader_dic
+    del test_set_dic
+    del criterion
+    del loss_all
+    del auc_all
+    del acc_hm_all
+
+    cleanup()
     return 0  # end of main
 
 
