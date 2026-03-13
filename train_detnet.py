@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+import csv
 
 import numpy as np
 import torch
@@ -21,6 +22,14 @@ from utils.eval.zimeval import EvalUtil
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cudnn.benchmark = True
 DEBUG = 0
+
+def compute_mpjpe_torch(pred, target):
+    return torch.norm(pred - target, dim=-1).mean()
+
+def compute_mpjpe_numpy(pred, target):
+    if pred.shape != target.shape:
+        raise ValueError(f"MPJPE shape mismatch: pred shape = {pred.shape}, target shape = {target.shape}")
+    return np.linalg.norm(pred - target, axis=-1).mean()
 
 
 def main(args):
@@ -59,6 +68,8 @@ def main(args):
     best_acc = {}
     auc_all = {}
     acc_hm_all = {}
+    mpjpe_all = {}
+
     for test_set_name in args.datasets_test:
         if test_set_name in ['stb', 'rhd', 'do']:
             test_set_dic[test_set_name] = HandDataset(
@@ -85,6 +96,7 @@ def main(args):
         best_acc[test_set_name] = 0
         auc_all[test_set_name] = []
         acc_hm_all[test_set_name] = []
+        mpjpe_all[test_set_name] = []
 
     total_test_set_size = 0
     for key, value in test_set_dic.items():
@@ -141,30 +153,35 @@ def main(args):
     )
 
     acc_hm = {}
+    mpjpe = {}
+
     loss_all = {"lossH": [],
                 "lossD": [],
                 "lossL": [],
-
                 }
+
+    train_mpjpe_all = []
 
     for epoch in range(args.start_epoch, args.epochs + 1):
         print('\nEpoch: %d' % (epoch + 1))
         for i in range(len(optimizer.param_groups)):
             print('group %d lr:' % i, optimizer.param_groups[i]['lr'])
         #############  trian for one epoch  ###############
-        train(
+        train_mpjpe = train(
             train_loader,
             model,
             criterion,
             optimizer,
             args=args, loss_all=loss_all
         )
+        train_mpjpe_all.append([epoch + 1, train_mpjpe])
         ##################################################
         auc = best_acc.copy() # need to deepcopy it because it's a dict
         for key, value in test_loader_dic.items():
-            auc[key], acc_hm[key] = validate(value, model, criterion, key, args=args)
+            auc[key], acc_hm[key], mpjpe[key] = validate(value, model, criterion, key, args=args)
             auc_all[key].append([epoch + 1, auc[key]])
             acc_hm_all[key].append([epoch + 1, acc_hm[key]])
+            mpjpe_all[key].append([epoch + 1, mpjpe[key]])
 
         misc.save_checkpoint(
             {
@@ -181,7 +198,14 @@ def main(args):
             if auc[key] > best_acc[key]:
                 best_acc[key] = auc[key]
 
-        misc.out_loss_auc(loss_all, auc_all, acc_hm_all, outpath=args.outpath) # to do
+        misc.out_loss_auc(
+            loss_all,
+            auc_all,
+            acc_hm_all,
+            outpath=args.outpath,
+            train_mpjpe_all_=train_mpjpe_all,
+            mpjpe_all_=mpjpe_all
+            )
 
         scheduler.step()
 
@@ -259,6 +283,8 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
     if key in ["stb", "rhd"]:
         am_accH = AverageMeter()
 
+    am_mpjpe = AverageMeter()
+
     evaluator = EvalUtil()
 
     if args.evaluate:
@@ -288,8 +314,34 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
                 gt_joints.extend(gt_joint.tolist())
                 pre_joints.extend(pred_joint.tolist())
 
+            print("key=", key)
+            print("raw pred shape=", pred_joint.shape)
+            print("raw gt shape=", gt_joint.shape)
+
             gt_joint, pred_joint_align = align.global_align(gt_joint, pred_joint, key=key)
 
+            print("aligned pred shape=", pred_joint_align.shape)
+            print("aligned gt shape=", gt_joint.shape)
+
+            if key in ["stb", "rhd"]:
+                # "stb"和"rhd"数据集是固定 21x3，直接按照原思路batch内计算
+                batch_mpjpe = compute_mpjpe_numpy(pred_joint_align, gt_joint)
+                am_mpjpe.update(batch_mpjpe, targets['batch_size'])
+
+                for targj, predj_a in zip(gt_joint, pred_joint_align):
+                    evaluator.feed(targj * 1000.0, predj_a * 1000.0)
+
+            elif key in ["do", "eo"]:
+                # "do"和"eo"数据集，每个样本有效joints数可能不同（5/4/3），故而逐样本计算
+                for targj, predj_a in zip(gt_joint, pred_joint_align):
+                    sample_mpjpe = compute_mpjpe_numpy(predj_a, targj)
+                    am_mpjpe.update(sample_mpjpe, 1)
+                    evaluator.feed(targj * 1000.0, predj_a * 1000.0)
+
+
+
+            batch_mpjpe = compute_mpjpe_numpy(pred_joint_align, gt_joint)
+            am_mpjpe.update(batch_mpjpe, targets['batch_size'])
 
             for targj, predj_a in zip(gt_joint, pred_joint_align):
                 evaluator.feed(targj * 1000.0, predj_a * 1000.0)
@@ -318,10 +370,12 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
     )
     print("AUC all of {}_test_set is : {}".format(key, auc_all))
 
+    print("MPJPE of {}_test_set is : {}".format(key, am_mpjpe.avg))
+
     if key in ["stb", "rhd"]:
-        return auc_all, am_accH.avg
+        return auc_all, am_accH.avg, am_mpjpe.avg
     elif key in ["do", "eo"]:
-        return auc_all, 0
+        return auc_all, 0, am_mpjpe.avg
 
 
 def train(train_loader, model, criterion, optimizer, args, loss_all):
@@ -331,6 +385,7 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
     am_loss_hm = AverageMeter()
     am_loss_dm = AverageMeter()
     am_loss_lm = AverageMeter()
+    am_mpjpe = AverageMeter()
 
     last = time.time()
     # switch to trian
@@ -346,6 +401,9 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
         am_loss_hm.update(losses['det_hm'].item(), targets['batch_size'])
         am_loss_dm.update(losses['det_dm'].item(), targets['batch_3d_size'].item())
         am_loss_lm.update(losses['det_lm'].item(), targets['batch_3d_size'].item())
+
+        batch_mpjpe = compute_mpjpe_torch(results['xyz'], targets['joint'])
+        am_mpjpe.update(batch_mpjpe.item(), targets['batch_size'])
 
         ''' backward and step '''
         optimizer.zero_grad()
@@ -364,6 +422,7 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
             'lH: {lossH:.7f} | '
             'lD: {lossD:.5f} | '
             'lL: {lossL:.5f} | '
+            'MPJPE: {mpjpe:.5f} | '
 
         ).format(
             batch=i + 1,
@@ -375,6 +434,7 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
             lossH=am_loss_hm.avg,
             lossD=am_loss_dm.avg,
             lossL=am_loss_lm.avg,
+            mpjpe=am_mpjpe.avg,
 
         )
 
@@ -388,6 +448,8 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
     loss_all["lossD"].append(am_loss_dm.avg)
     loss_all["lossL"].append(am_loss_lm.avg)
 
+    return am_mpjpe.avg
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -397,7 +459,7 @@ if __name__ == '__main__':
         '-dr',
         '--data_root',
         type=str,
-        default="/home/chen/datasets/",
+        default="data",
         help='dataset root directory'
     )
     parser.add_argument(

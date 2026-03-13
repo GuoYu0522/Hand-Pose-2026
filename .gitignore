@@ -1,2 +1,5 @@
 data/
+experiments/
+my_results/
+out_testset/
 *.mp4
