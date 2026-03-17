@@ -87,8 +87,8 @@ def main():
         #"train_batch": [16, 32],
         "train_batch": [32],
         "test_batch": [128],
-        "epochs": [2],
-        "workers": [6],
+        "epochs": [1],
+        "workers": [8],
         #"lr_decay_step": [50, 100],
         "lr_decay_step": [100],
         "gamma": [0.1],
@@ -120,7 +120,7 @@ def main():
     fixed_args = {
         "data_root": "data",   # 你的路径！！！
         "datasets_train": ["cmu", "rhd"],
-        "datasets_test": ["rhd", "do"],
+        "datasets_test": ["eo"],
         "snapshot": 1,
     }
 
