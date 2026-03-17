@@ -36,7 +36,7 @@ class EgoDexter(torch.utils.data.Dataset):
             raise ValueError("data_root: %s not exist" % data_root)
 
         self.name = 'eo'
-        self.data_root = os.path.join(data_root, 'EgoDexter/data')
+        self.data_root = os.path.join(data_root, 'EgoDexter/preview/data')
         self.data_split = data_split
         self.hand_side = hand_side
         self.clr_paths = []
@@ -65,7 +65,7 @@ class EgoDexter(torch.utils.data.Dataset):
 
         self.transform_image = transforms.Compose([
             transforms.CenterCrop((480, 480)),
-            transforms.Resize((128, 128), Image.ANTIALIAS),
+            transforms.Resize((128, 128), Image.Resampling.LANCZOS),
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [1, 1, 1])
         ])
@@ -269,7 +269,7 @@ class EgoDexter(torch.utils.data.Dataset):
             plt.subplot(2, 5, 10)
             transform_image_ = transforms.Compose([transforms.CenterCrop((480, 480)),
                                                    transforms.Resize((self.image_size, self.image_size),
-                                                                     Image.ANTIALIAS)])
+                                                                     Image.Resampling.LANCZOS)])
             plt.imshow(transform_image_(flip_clr.copy()))
             plt.title('Cropped_resized_flip_clr')
 
