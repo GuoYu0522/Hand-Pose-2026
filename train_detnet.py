@@ -1,15 +1,17 @@
 import argparse
 import os
 import time
-import json
 import csv
+import json
+import matplotlib.pyplot as plt
+import gc
+import shutil
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from progress.bar import Bar
 from tqdm import tqdm
-import gc
 
 import losses as losses
 import utils.misc as misc
@@ -24,6 +26,93 @@ from utils.eval.zimeval import EvalUtil
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cudnn.benchmark = True
 DEBUG = 0
+
+def compute_mpjpe_torch(pred, target):
+    return torch.norm(pred - target, dim=-1).mean()
+
+def compute_mpjpe_numpy(pred, target):
+    if pred.shape != target.shape:
+        raise ValueError(f"MPJPE shape mismatch: pred shape = {pred.shape}, target shape = {target.shape}")
+    return np.linalg.norm(pred - target, axis=-1).mean()
+
+def ensure_dir(path):
+    if not os.path.isdir(path):
+        os.makedirs(path)
+
+
+def save_dict_list_to_csv(rows, csv_path):
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_json(obj, json_path):
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=4, ensure_ascii=False)
+
+
+def plot_curve(x, y, title, xlabel, ylabel, save_path):
+    plt.figure(figsize=(8, 6))
+    plt.plot(x, y, marker='o')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+def save_learning_curves(curve_dir, loss_all, train_mpjpe_all, auc_all, acc_hm_all, mpjpe_all):
+    ensure_dir(curve_dir)
+
+    # 1) training losses
+    if len(loss_all["lossH"]) > 0:
+        epochs = list(range(1, len(loss_all["lossH"]) + 1))
+        plot_curve(epochs, loss_all["lossH"],
+                   "Training LossH Curve", "Epoch", "LossH",
+                   os.path.join(curve_dir, "train_lossH_curve.png"))
+        plot_curve(epochs, loss_all["lossD"],
+                   "Training LossD Curve", "Epoch", "LossD",
+                   os.path.join(curve_dir, "train_lossD_curve.png"))
+        plot_curve(epochs, loss_all["lossL"],
+                   "Training LossL Curve", "Epoch", "LossL",
+                   os.path.join(curve_dir, "train_lossL_curve.png"))
+
+    # 2) training MPJPE
+    if len(train_mpjpe_all) > 0:
+        epochs = [x[0] for x in train_mpjpe_all]
+        values = [x[1] for x in train_mpjpe_all]
+        plot_curve(epochs, values,
+                   "Training MPJPE Curve", "Epoch", "MPJPE",
+                   os.path.join(curve_dir, "train_mpjpe_curve.png"))
+
+    # 3) testing curves for each dataset
+    for key in auc_all.keys():
+        if len(auc_all[key]) > 0:
+            epochs = [x[0] for x in auc_all[key]]
+            values = [x[1] for x in auc_all[key]]
+            plot_curve(epochs, values,
+                       f"{key} Test AUC Curve", "Epoch", "AUC",
+                       os.path.join(curve_dir, f"{key}_test_auc_curve.png"))
+
+        if len(acc_hm_all[key]) > 0:
+            epochs = [x[0] for x in acc_hm_all[key]]
+            values = [x[1] for x in acc_hm_all[key]]
+            plot_curve(epochs, values,
+                       f"{key} Test AccHM Curve", "Epoch", "AccHM",
+                       os.path.join(curve_dir, f"{key}_test_acchm_curve.png"))
+
+        if len(mpjpe_all[key]) > 0:
+            epochs = [x[0] for x in mpjpe_all[key]]
+            values = [x[1] for x in mpjpe_all[key]]
+            plot_curve(epochs, values,
+                       f"{key} Test MPJPE Curve", "Epoch", "MPJPE",
+                       os.path.join(curve_dir, f"{key}_test_mpjpe_curve.png"))
 
 def cleanup():
     gc.collect()
@@ -96,7 +185,7 @@ def save_config(args):
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=4, ensure_ascii=False)
 
-def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all):
+def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all, train_mpjpe_all, mpjpe_all):
     metrics = {
         "run_name": args.run_name,
         "exp_dir": args.exp_dir,
@@ -123,6 +212,8 @@ def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all):
         "final_lossH": loss_all["lossH"][-1] if len(loss_all["lossH"]) > 0 else None,
         "final_lossD": loss_all["lossD"][-1] if len(loss_all["lossD"]) > 0 else None,
         "final_lossL": loss_all["lossL"][-1] if len(loss_all["lossL"]) > 0 else None,
+        "last_train_mpjpe": to_python(train_mpjpe_all[-1][1]) if len(train_mpjpe_all) > 0 else None,
+        "best_train_mpjpe": to_python(min([x[1] for x in train_mpjpe_all])) if len(train_mpjpe_all) > 0 else None,
     }
 
     for key in args.datasets_test:
@@ -138,6 +229,13 @@ def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all):
         else:
             metrics[f"last_acc_hm_{key}"] = None
 
+        if key in mpjpe_all and len(mpjpe_all[key]) > 0:
+            metrics[f"last_mpjpe_{key}"] = to_python(mpjpe_all[key][-1][1])
+            metrics[f"best_mpjpe_{key}"] = to_python(min([x[1] for x in mpjpe_all[key]]))
+        else:
+            metrics[f"last_mpjpe_{key}"] = None
+            metrics[f"best_mpjpe_{key}"] = None
+
     metrics_json_path = os.path.join(args.exp_dir, "metrics.json")
     with open(metrics_json_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4, ensure_ascii=False)
@@ -148,7 +246,6 @@ def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all):
         writer.writeheader()
         writer.writerow(metrics)
 
-
 def main(args):
     prepare_experiment_dirs(args)
     save_config(args)
@@ -156,6 +253,11 @@ def main(args):
     for path in [args.checkpoint, args.outpath]:
         if not os.path.isdir(path):
             os.makedirs(path)
+
+    result_dir = os.path.join(args.outpath, "results") # 放训练和测试结果表
+    curve_dir = os.path.join(args.outpath, "curves") # 放learning curves图
+    ensure_dir(result_dir)
+    ensure_dir(curve_dir)
 
     misc.print_args(args)
 
@@ -194,8 +296,11 @@ def main(args):
     test_set_dic = {}
     test_loader_dic = {}
     best_acc = {}
+    best_mpjpe = {}
     auc_all = {}
     acc_hm_all = {}
+    mpjpe_all = {}
+
     for test_set_name in args.datasets_test:
         if test_set_name in ['stb', 'rhd', 'do']:
             test_set_dic[test_set_name] = HandDataset(
@@ -220,8 +325,10 @@ def main(args):
             pin_memory=True, drop_last=False
         )
         best_acc[test_set_name] = 0
+        best_mpjpe[test_set_name] = float("inf")
         auc_all[test_set_name] = []
         acc_hm_all[test_set_name] = []
+        mpjpe_all[test_set_name] = []
 
     total_test_set_size = 0
     for key, value in test_set_dic.items():
@@ -278,28 +385,38 @@ def main(args):
     )
 
     acc_hm = {}
+    mpjpe = {}
+
     loss_all = {"lossH": [],
                 "lossD": [],
                 "lossL": [],
-
                 }
+
+    train_mpjpe_all = []
+    train_epoch_results = [] # 保存每个 epoch 的训练结果
+    test_epoch_results = [] # 保存每个 epoch、每个 test set 的测试结果
 
     for epoch in range(args.start_epoch, args.epochs + 1):
         print('\nEpoch: %d' % (epoch + 1))
-        
         for i in range(len(optimizer.param_groups)):
             print('group %d lr:' % i, optimizer.param_groups[i]['lr'])
         #############  trian for one epoch  ###############
-        print("Before Training")
-        print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
-        print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
-        train(
+        train_result = train(
             train_loader,
             model,
             criterion,
             optimizer,
             args=args, loss_all=loss_all
         )
+        train_mpjpe_all.append([epoch + 1, train_result["train_mpjpe"]])
+
+        train_epoch_results.append({
+            "epoch": epoch + 1,
+            "train_lossH": train_result["train_lossH"],
+            "train_lossD": train_result["train_lossD"],
+            "train_lossL": train_result["train_lossL"],
+            "train_mpjpe": train_result["train_mpjpe"],
+        })
         ##################################################
         auc = best_acc.copy() # need to deepcopy it because it's a dict
         print("Before Validating")
@@ -308,14 +425,23 @@ def main(args):
         for key, value in test_loader_dic.items():
             i = 0
             print(f"{i}th: key={key}, value={value}")
-            auc[key], acc_hm[key] = validate(value, model, criterion, key, args=args)
+            auc[key], acc_hm[key], mpjpe[key] = validate(value, model, criterion, key, args=args)
             auc_all[key].append([epoch + 1, auc[key]])
             acc_hm_all[key].append([epoch + 1, acc_hm[key]])
+            mpjpe_all[key].append([epoch + 1, mpjpe[key]])
             i = i+1
+            test_epoch_results.append({
+                "epoch": epoch + 1,
+                "test_set": key,
+                "auc": auc[key],
+                "acc_hm": acc_hm[key],
+                "mpjpe": mpjpe[key],
+            })
 
         print("After Validating, Before Save Checkpoints")
         print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
         print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
+
         misc.save_checkpoint(
             {
                 'epoch': epoch + 1,
@@ -327,6 +453,21 @@ def main(args):
             is_best=[auc, best_acc]
         )
 
+        # 保存 best MPJPE checkpoint（MPJPE 越小越好）
+        current_ckpt_path = os.path.join(args.checkpoint, '{}.pth'.format(args.saved_prefix))
+        fileprefix = os.path.splitext('{}.pth'.format(args.saved_prefix))[0]
+
+        for key in test_loader_dic.keys():
+            if np.isfinite(mpjpe[key]) and mpjpe[key] < best_mpjpe[key]:
+                best_mpjpe[key] = mpjpe[key]
+                shutil.copyfile(
+                    current_ckpt_path,
+                    os.path.join(
+                        args.checkpoint,
+                        '{}_{}_best_mpjpe.pth'.format(fileprefix, key)
+                    )
+                )
+
         print("After Save Checkpoints")
         print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
         print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
@@ -335,11 +476,47 @@ def main(args):
             if auc[key] > best_acc[key]:
                 best_acc[key] = auc[key]
 
-        misc.out_loss_auc(loss_all, auc_all, acc_hm_all, outpath=args.outpath) # to do
+        misc.out_loss_auc(
+            loss_all,
+            auc_all,
+            acc_hm_all,
+            outpath=args.outpath,
+            train_mpjpe_all_=train_mpjpe_all,
+            mpjpe_all_=mpjpe_all
+            )
+
+        # 保存训练/测试结果
+        save_dict_list_to_csv(
+            train_epoch_results,
+            os.path.join(result_dir, "train_epoch_results.csv")
+        )
+        save_json(
+            train_epoch_results,
+            os.path.join(result_dir, "train_epoch_results.json")
+        )
+
+        save_dict_list_to_csv(
+            test_epoch_results,
+            os.path.join(result_dir, "test_epoch_results.csv")
+        )
+        save_json(
+            test_epoch_results,
+            os.path.join(result_dir, "test_epoch_results.json")
+        )
+
+        # 保存learning curves
+        save_learning_curves(
+            curve_dir=curve_dir,
+            loss_all=loss_all,
+            train_mpjpe_all=train_mpjpe_all,
+            auc_all=auc_all,
+            acc_hm_all=acc_hm_all,
+            mpjpe_all=mpjpe_all
+        )
 
         scheduler.step()
 
-    save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all)
+    save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all, train_mpjpe_all, mpjpe_all)
 
     del model
     del optimizer
@@ -354,6 +531,7 @@ def main(args):
     del acc_hm_all
 
     cleanup()
+
     return 0  # end of main
 
 
@@ -428,6 +606,8 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
     if key in ["stb", "rhd"]:
         am_accH = AverageMeter()
 
+    am_mpjpe = AverageMeter()
+
     evaluator = EvalUtil()
 
     if args.evaluate:
@@ -459,10 +639,22 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
 
             gt_joint, pred_joint_align = align.global_align(gt_joint, pred_joint, key=key)
 
+            if key in ["stb", "rhd"]:
+                # "stb"和"rhd"数据集是固定 21x3，直接按照原思路batch内计算
+                batch_mpjpe = compute_mpjpe_numpy(pred_joint_align, gt_joint)
+                am_mpjpe.update(batch_mpjpe, targets['batch_size'])
 
-            for targj, predj_a in zip(gt_joint, pred_joint_align):
-                evaluator.feed(targj * 1000.0, predj_a * 1000.0)
-                # vis.multi_plot3d([targj * 1000.0, predj_a * 1000.0], title=["target", "pred"])
+                for targj, predj_a in zip(gt_joint, pred_joint_align):
+                    evaluator.feed(targj * 1000.0, predj_a * 1000.0)
+                    # vis.multi_plot3d([targj * 1000.0, predj_a * 1000.0], title=["target", "pred"])
+
+
+            elif key in ["do", "eo"]:
+                # "do"和"eo"数据集，每个样本有效joints数可能不同（5/4/3），故而逐样本计算
+                for targj, predj_a in zip(gt_joint, pred_joint_align):
+                    sample_mpjpe = compute_mpjpe_numpy(predj_a, targj)
+                    am_mpjpe.update(sample_mpjpe, 1)
+                    evaluator.feed(targj * 1000.0, predj_a * 1000.0)
 
             if stop != -1 and i >= stop:
                 break
@@ -486,11 +678,12 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
         20, 50, 15
     )
     print("AUC all of {}_test_set is : {}".format(key, auc_all))
+    print("MPJPE of {}_test_set is : {}".format(key, am_mpjpe.avg))
 
     if key in ["stb", "rhd"]:
-        return auc_all, am_accH.avg
+        return auc_all, am_accH.avg, am_mpjpe.avg
     elif key in ["do", "eo"]:
-        return auc_all, 0
+        return auc_all, 0, am_mpjpe.avg
 
 
 def train(train_loader, model, criterion, optimizer, args, loss_all):
@@ -500,6 +693,7 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
     am_loss_hm = AverageMeter()
     am_loss_dm = AverageMeter()
     am_loss_lm = AverageMeter()
+    am_mpjpe = AverageMeter()
 
     last = time.time()
     # switch to trian
@@ -515,6 +709,9 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
         am_loss_hm.update(losses['det_hm'].item(), targets['batch_size'])
         am_loss_dm.update(losses['det_dm'].item(), targets['batch_3d_size'].item())
         am_loss_lm.update(losses['det_lm'].item(), targets['batch_3d_size'].item())
+
+        batch_mpjpe = compute_mpjpe_torch(results['xyz'], targets['joint'])
+        am_mpjpe.update(batch_mpjpe.item(), targets['batch_size'])
 
         ''' backward and step '''
         optimizer.zero_grad()
@@ -533,6 +730,7 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
             'lH: {lossH:.7f} | '
             'lD: {lossD:.5f} | '
             'lL: {lossL:.5f} | '
+            'MPJPE: {mpjpe:.5f} | '
 
         ).format(
             batch=i + 1,
@@ -544,6 +742,7 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
             lossH=am_loss_hm.avg,
             lossD=am_loss_dm.avg,
             lossL=am_loss_lm.avg,
+            mpjpe=am_mpjpe.avg,
 
         )
 
@@ -556,6 +755,13 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
     loss_all["lossH"].append(am_loss_hm.avg)
     loss_all["lossD"].append(am_loss_dm.avg)
     loss_all["lossL"].append(am_loss_lm.avg)
+
+    return {
+        "train_lossH": am_loss_hm.avg,
+        "train_lossD": am_loss_dm.avg,
+        "train_lossL": am_loss_lm.avg,
+        "train_mpjpe": am_mpjpe.avg,
+    }
 
 
 if __name__ == '__main__':

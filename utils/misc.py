@@ -22,28 +22,38 @@ def param_count(net):
     return sum(p.numel() for p in net.parameters()) / 1e6
 
 
-
-
-def out_loss_auc(
-        loss_all_, auc_all_, acc_hm_all_, outpath
-):
+def out_loss_auc(loss_all_, auc_all_, acc_hm_all_, outpath, train_mpjpe_all_=None, mpjpe_all_=None):
     loss_all = copy.deepcopy(loss_all_)
     acc_hm_all = copy.deepcopy(acc_hm_all_)
     auc_all = copy.deepcopy(auc_all_)
 
+    train_mpjpe_all = copy.deepcopy(train_mpjpe_all_)
+    mpjpe_all = copy.deepcopy(mpjpe_all_)
+
     for k, l in zip(loss_all.keys(), loss_all.values()):
-        np.save(os.path.join(outpath, "{}.npy".format(k)), np.vstack((np.arange(1, len(l) + 1), np.array(l))).T)
+        np.save(
+            os.path.join(outpath, "{}.npy".format(k)),
+            np.vstack((np.arange(1, len(l) + 1), np.array(l))).T
+        )
 
     if len(acc_hm_all):
-        for key ,value in acc_hm_all.items():
-            acc_hm_all[key]=np.array(value)
+        for key, value in acc_hm_all.items():
+            acc_hm_all[key] = np.array(value)
         np.save(os.path.join(outpath, "acc_hm_all.npy"), acc_hm_all)
 
-
     if len(auc_all):
-        for key ,value in auc_all.items():
-            auc_all[key]=np.array(value)
+        for key, value in auc_all.items():
+            auc_all[key] = np.array(value)
         np.save(os.path.join(outpath, "auc_all.npy"), np.array(auc_all))
+
+    if train_mpjpe_all is not None and len(train_mpjpe_all):
+        train_mpjpe_all = np.array(train_mpjpe_all)
+        np.save(os.path.join(outpath, "train_mpjpe.npy"), train_mpjpe_all)
+
+    if mpjpe_all is not None and len(mpjpe_all):
+        for key, value in mpjpe_all.items():
+            mpjpe_all[key] = np.array(value)
+        np.save(os.path.join(outpath, "mpjpe_all.npy"), np.array(mpjpe_all))
 
 
 def saveloss(d):
@@ -62,17 +72,9 @@ def save_checkpoint(
 ):
     # preds = to_numpy(preds)
     filepath = os.path.join(checkpoint, filename)
-    # fileprefix = filename.split('.')[0]
-    fileprefix = os.path.splitext(filename)[0]
-    print("ckpt dir:",checkpoint)
-    print("save filepath:",filepath)
-    print("filepath length:",len(filepath))
-    # torch.save(state['model'].state_dict(), filepath)
-    save_obj = {
-        'epoch':state['epoch'],
-        'state_dict': state['model'].module.state_dict() if isinstance(state['model'], torch.nn.DataParallel) else state['model'].state_dict(),
-    }
-    torch.save(save_obj, filepath)
+    fileprefix = filename.split('.')[0]
+    # torch.save(state, filepath)
+    torch.save(state['model'].state_dict(), filepath)
 
     if snapshot and state['epoch'] % snapshot == 0:
         shutil.copyfile(
@@ -91,7 +93,7 @@ def save_checkpoint(
                 filepath,
                 os.path.join(
                     checkpoint,
-                    '{}_{}best.pth'.format(fileprefix, key)
+                    '{}_{}_best_auc.pth'.format(fileprefix, key)
                 )
             )
 
@@ -125,8 +127,6 @@ def load_checkpoint(model, checkpoint):
     model_state.update(state)
     model.load_state_dict(model_state)
     print(colored('loaded {}'.format(name), 'cyan'))
-    state_dict = torch.load(...)
-    model.load_state_dict(state_dict['state_dict'])
 
 
 def clean_state_dict(state_dict):

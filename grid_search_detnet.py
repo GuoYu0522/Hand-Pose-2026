@@ -87,7 +87,7 @@ def main():
         #"train_batch": [16, 32],
         "train_batch": [32],
         "test_batch": [128],
-        "epochs": [1],
+        "epochs": [2],
         "workers": [8],
         #"lr_decay_step": [50, 100],
         "lr_decay_step": [100],
