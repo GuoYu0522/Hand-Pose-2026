@@ -6,6 +6,7 @@ import json
 import matplotlib.pyplot as plt
 import gc
 import shutil
+import hashlib
 
 import numpy as np
 import torch
@@ -21,6 +22,8 @@ from model.detnet import detnet
 from utils import func, align
 from utils.eval.evalutils import AverageMeter, accuracy_heatmap
 from utils.eval.zimeval import EvalUtil
+from BioMC.BMCLoss import BMCLoss
+import BioMC.config_bmc_loss as cfg_bmc
 
 # select proper device to run
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -67,7 +70,7 @@ def plot_curve(x, y, title, xlabel, ylabel, save_path):
     plt.close()
 
 
-def save_learning_curves(curve_dir, loss_all, train_mpjpe_all, auc_all, acc_hm_all, mpjpe_all):
+def save_learning_curves(curve_dir, loss_all, train_mpjpe_all, auc_all, acc_hm_all, mpjpe_all, use_bmc=False):
     ensure_dir(curve_dir)
 
     # 1) training losses
@@ -82,6 +85,21 @@ def save_learning_curves(curve_dir, loss_all, train_mpjpe_all, auc_all, acc_hm_a
         plot_curve(epochs, loss_all["lossL"],
                    "Training LossL Curve", "Epoch", "LossL",
                    os.path.join(curve_dir, "train_lossL_curve.png"))
+
+        # ---- BMC loss curves (optional) ----
+        if use_bmc and "bmc_total" in loss_all and len(loss_all["bmc_total"]) > 0:
+            plot_curve(epochs, loss_all["bmc_total"],
+                       "Training BMC Total Loss Curve", "Epoch", "BMC Total Loss",
+                       os.path.join(curve_dir, "train_bmc_total_curve.png"))
+            plot_curve(epochs, loss_all["bmc_bl"],
+                       "Training BMC Bone Length Loss Curve", "Epoch", "BMC Bone Length Loss",
+                       os.path.join(curve_dir, "train_bmc_bl_curve.png"))
+            plot_curve(epochs, loss_all["bmc_rb"],
+                       "Training BMC Root Bone Loss Curve", "Epoch", "BMC Root Bone Loss",
+                       os.path.join(curve_dir, "train_bmc_rb_curve.png"))
+            plot_curve(epochs, loss_all["bmc_ja"],
+                       "Training BMC Joint Angle Loss Curve", "Epoch", "BMC Joint Angle Loss",
+                       os.path.join(curve_dir, "train_bmc_ja_curve.png"))
 
     # 2) training MPJPE
     if len(train_mpjpe_all) > 0:
@@ -144,6 +162,15 @@ def build_run_tag(args):
         f"_decay{args.lr_decay_step}"
     )
 
+def _short_name(text, max_len=40):
+    text = str(text)
+    if len(text)<= max_len:
+        return text
+    
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+    keep = max_len-9
+
+    return f"{text[:keep]}_{digest}"
 
 def prepare_experiment_dirs(args):
     """
@@ -158,13 +185,22 @@ def prepare_experiment_dirs(args):
     if args.exp_dir is None or str(args.exp_dir).strip() == "":
         run_tag = build_run_tag(args)
         args.run_name = args.run_name if args.run_name else run_tag
-        args.exp_dir = os.path.join("experiments", args.run_name)
+
+        # short_run_dir = _short_name(args.run_name, max_len = 40)
+        parts = args.run_name.split("_")
+        short_run_dir = "_".join(parts[:2]) if len(parts)>=2 else args.run_name
+        args.exp_dir = os.path.join("experiments", short_run_dir)
     else:
         if args.run_name is None or str(args.run_name).strip() == "":
             args.run_name = os.path.basename(os.path.normpath(args.exp_dir))
 
+    print(f"exp_dir: {args.exp_dir}")
+
     args.checkpoint = os.path.join(args.exp_dir, "checkpoints")
     args.outpath = os.path.join(args.exp_dir, "outputs")
+
+    print(f"checkpoint: { args.checkpoint}")
+    print(f"outpath: {args.outpath}")
 
     for path in [args.exp_dir, args.checkpoint, args.outpath]:
         if not os.path.isdir(path):
@@ -173,7 +209,10 @@ def prepare_experiment_dirs(args):
     # 若saved_prefix没显式设置成个性化名字，就自动加参数信息
     if args.saved_prefix == "ckp_detnet":
         #args.saved_prefix = f"ckp_detnet_{args.run_name}"
-        args.saved_prefix = f"ckp_detnet_{args.run_name[:30]}"
+        # short_prefix_name = _short_name(args.run_name, max_len = 30)
+        parts = args.run_name.split("_")
+        short_prefix_name = "_".join(parts[:2]) if len(parts)>=2 else args.run_name
+        args.saved_prefix = f"ckp_detnet_{short_prefix_name}"
 
 def to_python(obj):
     if isinstance(obj, torch.Tensor):
@@ -212,6 +251,13 @@ def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all, train_mpjpe_all,
         "final_lossH": loss_all["lossH"][-1] if len(loss_all["lossH"]) > 0 else None,
         "final_lossD": loss_all["lossD"][-1] if len(loss_all["lossD"]) > 0 else None,
         "final_lossL": loss_all["lossL"][-1] if len(loss_all["lossL"]) > 0 else None,
+
+        # ---- BMC metrics (optional) ----
+        "final_bmc_total": loss_all["bmc_total"][-1] if ("bmc_total" in loss_all and len(loss_all["bmc_total"]) > 0) else None,
+        "final_bmc_bl": loss_all["bmc_bl"][-1] if ("bmc_bl" in loss_all and len(loss_all["bmc_bl"]) > 0) else None,
+        "final_bmc_rb": loss_all["bmc_rb"][-1] if ("bmc_rb" in loss_all and len(loss_all["bmc_rb"]) > 0) else None,
+        "final_bmc_ja": loss_all["bmc_ja"][-1] if ("bmc_ja" in loss_all and len(loss_all["bmc_ja"]) > 0) else None,
+
         "last_train_mpjpe": to_python(train_mpjpe_all[-1][1]) if len(train_mpjpe_all) > 0 else None,
         "best_train_mpjpe": to_python(min([x[1] for x in train_mpjpe_all])) if len(train_mpjpe_all) > 0 else None,
     }
@@ -246,16 +292,42 @@ def save_metrics(args, best_acc, auc_all, acc_hm_all, loss_all, train_mpjpe_all,
         writer.writeheader()
         writer.writerow(metrics)
 
+def prepare_joints_for_bmc(joints):
+    """
+    Only for BMCLoss:
+    1) root-relative
+    2) scale-invariant using cfg_bmc.REF_BONE_LINK
+
+    Args:
+        joints: [B, 21, 3]
+
+    Returns:
+        joints_bmc: [B, 21, 3]
+    """
+    # root-relative
+    root = joints[:, cfg_bmc.JOINT_ROOT_IDX:cfg_bmc.JOINT_ROOT_IDX + 1, :]
+    joints_bmc = joints - root
+
+    # scale-invariant
+    ref_a, ref_b = cfg_bmc.REF_BONE_LINK
+    ref_bone = joints_bmc[:, ref_a, :] - joints_bmc[:, ref_b, :]
+    ref_len = torch.norm(ref_bone, dim=-1, keepdim=True).unsqueeze(-1).clamp_min(1e-8)
+
+    joints_bmc = joints_bmc / ref_len
+    return joints_bmc
+
+
 def main(args):
+    print("During dir preparation:")
     prepare_experiment_dirs(args)
     save_config(args)
 
     for path in [args.checkpoint, args.outpath]:
         if not os.path.isdir(path):
             os.makedirs(path)
-
-    result_dir = os.path.join(args.outpath, "results") # 放训练和测试结果表
-    curve_dir = os.path.join(args.outpath, "curves") # 放learning curves图
+    print(f"outpath: {args.outpath}")
+    result_dir = os.path.join(args.outpath, "epoch_results") # 放训练和测试结果表
+    curve_dir = os.path.join(args.outpath, "learning_curves") # 放learning curves图
     ensure_dir(result_dir)
     ensure_dir(curve_dir)
 
@@ -269,6 +341,9 @@ def main(args):
         out_feature_dim_resnet=args.out_feature_dim_resnet,
         hidden_dim_detnet=args.hidden_dim_detnet,
         layers_net2d=args.layers_net2d,
+        layers_net3d=args.layers_net3d,
+        net2d_version=args.net2d_version,
+        net3d_version=args.net3d_version,
         stacks=args.stacks
     )
     model.to(device)
@@ -282,6 +357,17 @@ def main(args):
     criterion = {
         'det': criterion_det
     }
+
+    # ---- BMC loss (optional) ----
+    if args.bmc_loss:
+        criterion['bmc'] = BMCLoss(
+            lambda_bl=args.lambda_bmc_bl,
+            lambda_rb=args.lambda_bmc_rb,
+            lambda_ja=args.lambda_bmc_ja,
+            bmc_dir=args.bmc_dir,
+            device=device,
+        )
+
     optimizer = torch.optim.Adam(
         [
             {
@@ -390,6 +476,10 @@ def main(args):
     loss_all = {"lossH": [],
                 "lossD": [],
                 "lossL": [],
+                "bmc_total": [],
+                "bmc_bl": [],
+                "bmc_rb": [],
+                "bmc_ja": [],
                 }
 
     train_mpjpe_all = []
@@ -410,32 +500,42 @@ def main(args):
         )
         train_mpjpe_all.append([epoch + 1, train_result["train_mpjpe"]])
 
-        train_epoch_results.append({
+        train_epoch_info = {
             "epoch": epoch + 1,
             "train_lossH": train_result["train_lossH"],
             "train_lossD": train_result["train_lossD"],
             "train_lossL": train_result["train_lossL"],
             "train_mpjpe": train_result["train_mpjpe"],
-        })
+        }
+
+        if args.bmc_loss:
+            train_epoch_info.update({
+                "train_bmc_total": train_result["train_bmc_total"],
+                "train_bmc_bl": train_result["train_bmc_bl"],
+                "train_bmc_rb": train_result["train_bmc_rb"],
+                "train_bmc_ja": train_result["train_bmc_ja"],
+            })
+
+        train_epoch_results.append(train_epoch_info)
         ##################################################
         auc = best_acc.copy() # need to deepcopy it because it's a dict
+
         print("Before Validating")
         print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
         print("reserved :", torch.cuda.memory_reserved() / 1024**2, "MB")
-        for key, value in test_loader_dic.items():
-            i = 0
+        for i, (key, value) in enumerate(test_loader_dic.items()):
             print(f"{i}th: key={key}, value={value}")
             auc[key], acc_hm[key], mpjpe[key] = validate(value, model, criterion, key, args=args)
             auc_all[key].append([epoch + 1, auc[key]])
             acc_hm_all[key].append([epoch + 1, acc_hm[key]])
             mpjpe_all[key].append([epoch + 1, mpjpe[key]])
-            i = i+1
+
             test_epoch_results.append({
-                "epoch": epoch + 1,
-                "test_set": key,
-                "auc": auc[key],
-                "acc_hm": acc_hm[key],
-                "mpjpe": mpjpe[key],
+                "epoch": int(epoch + 1),
+                "test_set": str(key),
+                "auc": float(auc[key]) if auc[key] is not None else None,
+                "acc_hm": float(acc_hm[key]) if acc_hm[key] is not None else None,
+                "mpjpe": float(mpjpe[key]) if mpjpe[key] is not None else None,
             })
 
         print("After Validating, Before Save Checkpoints")
@@ -455,18 +555,21 @@ def main(args):
 
         # 保存 best MPJPE checkpoint（MPJPE 越小越好）
         current_ckpt_path = os.path.join(args.checkpoint, '{}.pth'.format(args.saved_prefix))
-        fileprefix = os.path.splitext('{}.pth'.format(args.saved_prefix))[0]
+        fileprefix = args.saved_prefix
 
         for key in test_loader_dic.keys():
             if np.isfinite(mpjpe[key]) and mpjpe[key] < best_mpjpe[key]:
                 best_mpjpe[key] = mpjpe[key]
-                shutil.copyfile(
-                    current_ckpt_path,
-                    os.path.join(
-                        args.checkpoint,
-                        '{}_{}_best_mpjpe.pth'.format(fileprefix, key)
-                    )
+
+                dst_path = os.path.join(
+                    args.checkpoint,
+                    f'{fileprefix}_{key}_best_mpjpe.pth'
                 )
+
+                print("[DEBUG] src =", os.path.abspath(current_ckpt_path), "len =", len(os.path.abspath(current_ckpt_path)))
+                print("[DEBUG] dst =", os.path.abspath(dst_path), "len =", len(os.path.abspath(dst_path)))
+
+                shutil.copyfile(current_ckpt_path, dst_path)
 
         print("After Save Checkpoints")
         print("allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
@@ -511,7 +614,8 @@ def main(args):
             train_mpjpe_all=train_mpjpe_all,
             auc_all=auc_all,
             acc_hm_all=acc_hm_all,
-            mpjpe_all=mpjpe_all
+            mpjpe_all=mpjpe_all,
+            use_bmc=args.bmc_loss
         )
 
         scheduler.step()
@@ -595,6 +699,18 @@ def one_forward_pass(metas, model, criterion, args, train=True):
 
         targets["batch_3d_size"] = batch_3d_size
 
+    # ---- optional BMCLoss branch ----
+    if args.bmc_loss:
+        # only use normalized joints for BMCLoss
+        # do NOT modify results['xyz']
+        joints_bmc = prepare_joints_for_bmc(results['xyz'])
+
+        bmc_total_loss, bmc_losses = criterion['bmc'].compute_loss(joints_bmc)
+        total_loss += bmc_total_loss
+
+        losses['bmc_total_loss'] = bmc_total_loss
+        losses.update(bmc_losses)
+
     return results, {**targets, **infos}, total_loss, losses
 
 
@@ -648,7 +764,6 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
                     evaluator.feed(targj * 1000.0, predj_a * 1000.0)
                     # vis.multi_plot3d([targj * 1000.0, predj_a * 1000.0], title=["target", "pred"])
 
-
             elif key in ["do", "eo"]:
                 # "do"和"eo"数据集，每个样本有效joints数可能不同（5/4/3），故而逐样本计算
                 for targj, predj_a in zip(gt_joint, pred_joint_align):
@@ -678,6 +793,7 @@ def validate(val_loader, model, criterion, key, args, stop=-1):
         20, 50, 15
     )
     print("AUC all of {}_test_set is : {}".format(key, auc_all))
+
     print("MPJPE of {}_test_set is : {}".format(key, am_mpjpe.avg))
 
     if key in ["stb", "rhd"]:
@@ -693,6 +809,10 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
     am_loss_hm = AverageMeter()
     am_loss_dm = AverageMeter()
     am_loss_lm = AverageMeter()
+    am_bmc_total = AverageMeter()
+    am_bmc_bl = AverageMeter()
+    am_bmc_rb = AverageMeter()
+    am_bmc_ja = AverageMeter()
     am_mpjpe = AverageMeter()
 
     last = time.time()
@@ -709,6 +829,12 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
         am_loss_hm.update(losses['det_hm'].item(), targets['batch_size'])
         am_loss_dm.update(losses['det_dm'].item(), targets['batch_3d_size'].item())
         am_loss_lm.update(losses['det_lm'].item(), targets['batch_3d_size'].item())
+
+        if args.bmc_loss:
+            am_bmc_total.update(losses['bmc_total_loss'].item(), targets['batch_size'])
+            am_bmc_bl.update(losses['bmc_bl'].item(), targets['batch_size'])
+            am_bmc_rb.update(losses['bmc_rb'].item(), targets['batch_size'])
+            am_bmc_ja.update(losses['bmc_ja'].item(), targets['batch_size'])
 
         batch_mpjpe = compute_mpjpe_torch(results['xyz'], targets['joint'])
         am_mpjpe.update(batch_mpjpe.item(), targets['batch_size'])
@@ -730,6 +856,10 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
             'lH: {lossH:.7f} | '
             'lD: {lossD:.5f} | '
             'lL: {lossL:.5f} | '
+            'bmcT: {bmcT:.5f} | '
+            'bmcBL: {bmcBL:.5f} | '
+            'bmcRB: {bmcRB:.5f} | '
+            'bmcJA: {bmcJA:.5f} | '
             'MPJPE: {mpjpe:.5f} | '
 
         ).format(
@@ -742,6 +872,10 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
             lossH=am_loss_hm.avg,
             lossD=am_loss_dm.avg,
             lossL=am_loss_lm.avg,
+            bmcT=am_bmc_total.avg if args.bmc_loss else 0.0,
+            bmcBL=am_bmc_bl.avg if args.bmc_loss else 0.0,
+            bmcRB=am_bmc_rb.avg if args.bmc_loss else 0.0,
+            bmcJA=am_bmc_ja.avg if args.bmc_loss else 0.0,
             mpjpe=am_mpjpe.avg,
 
         )
@@ -755,11 +889,19 @@ def train(train_loader, model, criterion, optimizer, args, loss_all):
     loss_all["lossH"].append(am_loss_hm.avg)
     loss_all["lossD"].append(am_loss_dm.avg)
     loss_all["lossL"].append(am_loss_lm.avg)
+    loss_all["bmc_total"].append(am_bmc_total.avg if args.bmc_loss else 0.0)
+    loss_all["bmc_bl"].append(am_bmc_bl.avg if args.bmc_loss else 0.0)
+    loss_all["bmc_rb"].append(am_bmc_rb.avg if args.bmc_loss else 0.0)
+    loss_all["bmc_ja"].append(am_bmc_ja.avg if args.bmc_loss else 0.0)
 
     return {
         "train_lossH": am_loss_hm.avg,
         "train_lossD": am_loss_dm.avg,
         "train_lossL": am_loss_lm.avg,
+        "train_bmc_total": am_bmc_total.avg if args.bmc_loss else 0.0,
+        "train_bmc_bl": am_bmc_bl.avg if args.bmc_loss else 0.0,
+        "train_bmc_rb": am_bmc_rb.avg if args.bmc_loss else 0.0,
+        "train_bmc_ja": am_bmc_ja.avg if args.bmc_loss else 0.0,
         "train_mpjpe": am_mpjpe.avg,
     }
 
@@ -972,10 +1114,60 @@ if __name__ == '__main__':
         help='detnet: layers_net2d'
     )
     parser.add_argument(
+        '--layers_net3d',
+        nargs='+',
+        type=int,
+        default=[3, 3],
+        help='detnet: layers_net3d'
+    )
+    parser.add_argument(
+        '--net2d_version',
+        type=str,
+        default="bottleneck",
+        help='detnet: net2d_version, choose bottleneck or legacy'
+    )
+    parser.add_argument(
+        '--net3d_version',
+        type=str,
+        default="bottleneck",
+        help='detnet: net3d_version, choose bottleneck or legacy'
+    )
+    parser.add_argument(
         '--stacks',
         type=int,
         default=1,
         help='detnet: stacks'
     )
+    # BMC Loss
+    parser.add_argument(
+        '--bmc_loss',
+        action='store_true',
+        help='enable BMCLoss as an additional optional loss'
+    )
+    parser.add_argument(
+        '--lambda_bmc_bl',
+        type=float,
+        default=0.0,
+        help='weight for BMC bone-length loss'
+    )
+    parser.add_argument(
+        '--lambda_bmc_rb',
+        type=float,
+        default=0.0,
+        help='weight for BMC root-bone loss'
+    )
+    parser.add_argument(
+        '--lambda_bmc_ja',
+        type=float,
+        default=0.0,
+        help='weight for BMC joint-angle loss'
+    )
+    parser.add_argument(
+        '--bmc_dir',
+        type=str,
+        default='BMC',
+        help='directory containing precomputed BMC npy files'
+    )
+
 
     main(parser.parse_args())

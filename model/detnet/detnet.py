@@ -40,8 +40,24 @@ def get_pose_tile_torch(N):
 #         x = self.prediction(x).sigmoid()
 #         return x
 
-class net_2d(nn.Module):
-    def __init__(self, input_features, output_features, stride, layers=[3,3], joints=21, norm_layer=None):
+class net_2d_legacy(nn.Module):
+    def __init__(self, input_features, output_features, stride, joints=21):
+        super().__init__()
+        self.project = nn.Sequential(
+            conv3x3(input_features, output_features, stride),
+            nn.BatchNorm2d(output_features),
+            nn.ReLU()
+        )
+        self.prediction = nn.Conv2d(output_features, joints, 1, 1, 0)
+
+    def forward(self, x):
+        x = self.project(x)
+        x = self.prediction(x).sigmoid()
+        return x
+
+
+class net_2d_bottleneck(nn.Module):
+    def __init__(self, input_features, output_features, stride, layers=[3, 3], joints=21, norm_layer=None):
         super().__init__()
         self._norm_layer = nn.BatchNorm2d if norm_layer is None else norm_layer
         self.dilation = 1
@@ -49,17 +65,17 @@ class net_2d(nn.Module):
         self.base_width = 64
 
         self.inplanes = input_features
-        planes = max(1, output_features // Bottleneck.expansion) # Flooring
+        planes = max(1, output_features // Bottleneck.expansion)  # Flooring
         bottleneck_out = planes * Bottleneck.expansion
 
-        #  adaptive bottleneck stack
+        # adaptive bottleneck stack
         self.blocks = nn.ModuleList()
         for num_blocks in layers:
             self.blocks.append(
                 self._make_layer(Bottleneck, planes, num_blocks, stride=2, dilate=True)
             )
 
-        # if output_features != bottleneck_out, 强行对齐with 1*1 conv
+        # if output_features != bottleneck_out, 强行对齐 with 1*1 conv
         if output_features != bottleneck_out:
             self.channel_adjust = nn.Sequential(
                 conv1x1(bottleneck_out, output_features, stride=1),
@@ -86,13 +102,17 @@ class net_2d(nn.Module):
             )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
-                            self.base_width,self.dilation, norm_layer))
+        layers.append(block(
+            self.inplanes, planes, stride, downsample, self.groups,
+            self.base_width, self.dilation, norm_layer
+        ))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, groups=self.groups,
-                                base_width=self.base_width, dilation=self.dilation,
-                                norm_layer=norm_layer))
+            layers.append(block(
+                self.inplanes, planes, groups=self.groups,
+                base_width=self.base_width, dilation=self.dilation,
+                norm_layer=norm_layer
+            ))
 
         return nn.Sequential(*layers)
 
@@ -104,30 +124,213 @@ class net_2d(nn.Module):
         return x
 
 
-class net_3d(nn.Module):
+# net_2d 统一接口
+class net_2d(nn.Module):
+    def __init__(
+        self,
+        input_features,
+        output_features,
+        stride,
+        layers=[3, 3],
+        joints=21,
+        norm_layer=None,
+        version="bottleneck"   # 默认使用bottlenecked net_2d
+    ):
+        super().__init__()
+
+        if version == "legacy":
+            self.impl = net_2d_legacy(
+                input_features=input_features,
+                output_features=output_features,
+                stride=stride,
+                joints=joints
+            )
+        elif version == "bottleneck":
+            self.impl = net_2d_bottleneck(
+                input_features=input_features,
+                output_features=output_features,
+                stride=stride,
+                layers=layers,
+                joints=joints,
+                norm_layer=norm_layer
+            )
+        else:
+            raise ValueError(f"Unsupported net_2d version: {version}. Use 'legacy' or 'bottleneck'.")
+
+    def forward(self, x):
+        return self.impl(x)
+
+
+class net_3d_legacy(nn.Module):
     def __init__(self, input_features, output_features, stride, joints=21, need_norm=False):
         super().__init__()
         self.need_norm = need_norm
-        self.project = nn.Sequential(conv3x3(input_features, output_features, stride), nn.BatchNorm2d(output_features),
-                                     nn.ReLU())
+        self.project = nn.Sequential(
+            conv3x3(input_features, output_features, stride),
+            nn.BatchNorm2d(output_features),
+            nn.ReLU()
+        )
         self.prediction = nn.Conv2d(output_features, joints * 3, 1, 1, 0)
 
     def forward(self, x):
         x = self.prediction(self.project(x))
-
         dmap = rearrange(x, 'b (j l) h w -> b j l h w', l=3)
-
         return dmap
 
 
-class detnet(nn.Module):
-    def __init__(self, layers_resnet=[2,4,6], block_planes_resnet=[64, 128, 256], inplanes_resnet=64, out_feature_dim_resnet=256, hidden_dim_detnet=256, layers_net2d=[3,3], stacks=1):
+class net_3d_bottleneck(nn.Module):
+    def __init__(self, input_features, output_features, stride, layers=[3, 3], joints=21, need_norm=False, norm_layer=None):
         super().__init__()
-        self.resnet50 = resnet50(layers=layers_resnet, block_planes=block_planes_resnet, inplanes=inplanes_resnet, out_feature_dim=out_feature_dim_resnet)
+        self.need_norm = need_norm
+        self._norm_layer = nn.BatchNorm2d if norm_layer is None else norm_layer
+        self.dilation = 1
+        self.groups = 1
+        self.base_width = 64
 
-        self.hmap_0 = net_2d(out_feature_dim_resnet + 2, hidden_dim_detnet, 1, layers=layers_net2d)
-        self.dmap_0 = net_3d(hidden_dim_detnet + 2 + 21, hidden_dim_detnet, 1)
-        self.lmap_0 = net_3d(hidden_dim_detnet + 2 + 21 * 4, hidden_dim_detnet, 1)
+        self.inplanes = input_features
+        planes = max(1, output_features // Bottleneck.expansion)  # Flooring
+        bottleneck_out = planes * Bottleneck.expansion
+
+        # adaptive bottleneck stack
+        self.blocks = nn.ModuleList()
+        for num_blocks in layers:
+            self.blocks.append(
+                self._make_layer(Bottleneck, planes, num_blocks, stride=2, dilate=True)
+            )
+
+        # if output_features != bottleneck_out, 强行对齐 with 1*1 conv
+        if output_features != bottleneck_out:
+            self.channel_adjust = nn.Sequential(
+                conv1x1(bottleneck_out, output_features, stride=1),
+                self._norm_layer(output_features),
+                nn.ReLU()
+            )
+        else:
+            self.channel_adjust = nn.Identity()
+
+        # final prediction head
+        self.prediction = nn.Conv2d(output_features, joints * 3, 1, 1, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+        norm_layer = self._norm_layer
+        downsample = None
+        previous_dilation = self.dilation
+        if dilate:
+            self.dilation *= stride
+            stride = 1
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride),
+                norm_layer(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(
+            self.inplanes, planes, stride, downsample, self.groups,
+            self.base_width, self.dilation, norm_layer
+        ))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(
+                self.inplanes, planes, groups=self.groups,
+                base_width=self.base_width, dilation=self.dilation,
+                norm_layer=norm_layer
+            ))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        x = self.channel_adjust(x)
+        x = self.prediction(x)
+        dmap = rearrange(x, 'b (j l) h w -> b j l h w', l=3)
+        return dmap
+
+
+# net_3d 统一接口
+class net_3d(nn.Module):
+    def __init__(
+        self,
+        input_features,
+        output_features,
+        stride,
+        layers=[3, 3],
+        joints=21,
+        need_norm=False,
+        norm_layer=None,
+        version="bottleneck"   # 默认使用bottlenecked net_3d
+    ):
+        super().__init__()
+
+        if version == "legacy":
+            self.impl = net_3d_legacy(
+                input_features=input_features,
+                output_features=output_features,
+                stride=stride,
+                joints=joints,
+                need_norm=need_norm
+            )
+        elif version == "bottleneck":
+            self.impl = net_3d_bottleneck(
+                input_features=input_features,
+                output_features=output_features,
+                stride=stride,
+                layers=layers,
+                joints=joints,
+                need_norm=need_norm,
+                norm_layer=norm_layer
+            )
+        else:
+            raise ValueError(f"Unsupported net_3d version: {version}. Use 'legacy' or 'bottleneck'.")
+
+    def forward(self, x):
+        return self.impl(x)
+
+
+class detnet(nn.Module):
+    def __init__(
+        self,
+        layers_resnet=[2, 4, 6],
+        block_planes_resnet=[64, 128, 256],
+        inplanes_resnet=64,
+        out_feature_dim_resnet=256,
+        hidden_dim_detnet=256,
+        layers_net2d=[3, 3],
+        layers_net3d=[3, 3],
+        net2d_version="bottleneck",   # 默认使用bottlenecked net_2d
+        net3d_version="bottleneck",   # 默认使用bottlenecked net_3d
+        stacks=1
+    ):
+        super().__init__()
+        self.resnet50 = resnet50(
+            layers=layers_resnet,
+            block_planes=block_planes_resnet,
+            inplanes=inplanes_resnet,
+            out_feature_dim=out_feature_dim_resnet
+        )
+
+        self.hmap_0 = net_2d(
+            out_feature_dim_resnet + 2,
+            hidden_dim_detnet,
+            1,
+            layers=layers_net2d,
+            version=net2d_version
+        )
+        self.dmap_0 = net_3d(
+            hidden_dim_detnet + 2 + 21,
+            hidden_dim_detnet,
+            1,
+            layers=layers_net3d,
+            version=net3d_version
+        )
+        self.lmap_0 = net_3d(
+            hidden_dim_detnet + 2 + 21 * 4,
+            hidden_dim_detnet,
+            1,
+            layers=layers_net3d,
+            version=net3d_version
+        )
         self.stacks = stacks
 
     def forward(self, x):

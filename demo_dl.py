@@ -19,7 +19,7 @@ _mano_root = 'mano/models'
 
 module = detnet().to(device)
 print('load model start')
-check_point = torch.load('experiments\grid_search_20260313_210845\exp_0001_lr0.001_tb32_lres2-4-6_bp64-128-256_in64_out256_hid256_ln2d3-3_st1_ep100_g0.1_decay100\checkpoints\ckp_detnet_exp_0001_lr0.001_tb32_lres2-4-_rhdbest.pth', map_location=device)
+check_point = torch.load('experiments\grid_search_20260313_210845\exp_0003_lr0.001_tb32_lres2-3-4_bp64-128-256_in64_out256_hid256_ln2d3-3_st1_ep100_g0.1_decay100\checkpoints\ckp_detnet_exp_0003_lr0.001_tb32_lres2-3-_dobest.pth', map_location=device)
 print("OG ckp keys: ", check_point.keys())
 
 if 'state_dict' in check_point:
