@@ -116,8 +116,8 @@ def main():
         ],
         "block_planes_resnet": [
             # #[32, 64, 128],
-            [64, 128, 128],
-            ## [64, 128, 256],
+            # [64, 128, 128],
+            [64, 128, 256],
            # [64, 128, 512]
         ],
 
@@ -138,8 +138,8 @@ def main():
           #  "legacy"
         ],
         "net3d_version": [
-           "bottleneck",
-          #  "legacy"
+           # "bottleneck",
+            "legacy"
         ],
         #"stacks": [1, 2],
         "stacks": [1],

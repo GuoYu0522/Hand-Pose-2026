@@ -12,42 +12,230 @@ from model import shape_net
 import os
 import csv
 import json
+import inspect
 from datetime import datetime
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 _mano_root = 'mano/models'
 
-module = detnet().to(device)
-print('load model start')
-check_point = torch.load('experiments\grid_search_20260313_210845\exp_0003_lr0.001_tb32_lres2-3-4_bp64-128-256_in64_out256_hid256_ln2d3-3_st1_ep100_g0.1_decay100\checkpoints\ckp_detnet_exp_0003_lr0.001_tb32_lres2-3-_dobest.pth', map_location=device)
-print("OG ckp keys: ", check_point.keys())
+CONFIG_JSON_PATH = r'experiments\grid_search_20260528_023246\exp_0001\config.json'
+CKPT_PATH = r'experiments\grid_search_20260528_023246\exp_0001\checkpoints\ckp_detnet_exp_0001_do_best_auc.pth'
 
-if 'state_dict' in check_point:
-    pretrained_dict = check_point['state_dict']
-else:
-    pretrained_dict = check_point
+def build_detnet_from_config(config_json_path, device):
+    """
+    从config.json自动读取detnet需要的参数。
+    只会取detnet.__init__需要的参数。
+    """
+    with open(config_json_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
 
-new_pretrained_dict = {}
-for k, v in pretrained_dict.items():
-    if k.startswith('module.'):
-        k = k[7:]
-    new_pretrained_dict[k] = v
+    detnet_signature = inspect.signature(detnet.__init__)
+    valid_keys = [
+        k for k in detnet_signature.parameters.keys()
+        if k != "self"
+    ]
 
-model_state = module.state_dict()
-matched_dict = {}
-for k, v in new_pretrained_dict.items():
-    if k in model_state:
-        if model_state[k].shape == v.shape:
-            matched_dict[k] = v
+    detnet_kwargs = {
+        k: config[k]
+        for k in valid_keys
+        if k in config
+    }
+
+    print("[INFO] Build detnet with config:")
+    for k, v in detnet_kwargs.items():
+        print(f"  {k}: {v}")
+
+    model = detnet(**detnet_kwargs).to(device)
+    return model
+
+
+def extract_state_dict_from_checkpoint(check_point):
+    """
+    兼容多种ckp保存方式：
+    1) {'state_dict': ...}
+    2) {'model': DataParallel(model)}
+    3) {'model': model}
+    4) 纯state_dict
+    """
+    if isinstance(check_point, dict) and "state_dict" in check_point:
+        state_dict = check_point["state_dict"]
+
+    elif isinstance(check_point, dict) and "model" in check_point:
+        saved_model = check_point["model"]
+
+        if isinstance(saved_model, torch.nn.DataParallel):
+            state_dict = saved_model.module.state_dict()
+        elif hasattr(saved_model, "state_dict"):
+            state_dict = saved_model.state_dict()
         else:
-            print(f"shape mismatch: {k}, ckp={v.shape}, model={matched_dict[k].shape}")
-        # print (k, ' is in current model')
+            raise TypeError("checkpoint['model'] exists, but it is not a torch model.")
+
+    elif isinstance(check_point, dict):
+        state_dict = check_point
+
     else:
-        print(k, ' is NOT in current model')
-model_state.update(matched_dict)
-module.load_state_dict(model_state)
-print(f"Loaded params: {len(matched_dict)}/{len(model_state)}")
-print('load model finished')
+        raise TypeError(f"Unsupported checkpoint type: {type(check_point)}")
+
+    # 去掉 DataParallel 的 module. 前缀
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            k = k[7:]
+        new_state_dict[k] = v
+
+    return new_state_dict
+
+
+def load_detnet_checkpoint_auto(config_json_path, ckpt_path, device, strict=True):
+    """
+    1) 从config.json初始化detnet
+    2) 从checkpoint提取state_dict
+    3) 加载权重
+
+    strict=True: 要求模型结构和checkpoint完全一致。
+    strict=False: 允许部分加载。
+    """
+    print("Load detnet start")
+
+    module = build_detnet_from_config(config_json_path, device)
+
+    check_point = torch.load(ckpt_path, map_location=device)
+
+    if isinstance(check_point, dict):
+        print("OG ckp keys:", check_point.keys())
+    else:
+        print("OG ckp type:", type(check_point))
+
+    pretrained_dict = extract_state_dict_from_checkpoint(check_point)
+
+    if strict:
+        module.load_state_dict(pretrained_dict, strict=True)
+        print(f"[OK] Strict loaded params: {len(pretrained_dict)}")
+    else:
+        model_state = module.state_dict()
+
+        matched_dict = {}
+        missing_in_current_model = []
+        shape_mismatch = []
+
+        for k, v in pretrained_dict.items():
+            if k not in model_state:
+                missing_in_current_model.append(k)
+                continue
+
+            if model_state[k].shape != v.shape:
+                shape_mismatch.append((k, v.shape, model_state[k].shape))
+                continue
+
+            matched_dict[k] = v
+
+        not_loaded = [k for k in model_state.keys() if k not in matched_dict]
+
+        model_state.update(matched_dict)
+        module.load_state_dict(model_state, strict=False)
+
+        print(f"[WARN] Non-strict loaded params: {len(matched_dict)} / {len(model_state)}")
+        print(f"[WARN] checkpoint params not in current detent model: {len(missing_in_current_model)}")
+        print(f"[WARN] shape mismatch params: {len(shape_mismatch)}")
+        print(f"[WARN] current detent model params not loaded: {len(not_loaded)}")
+
+        if len(missing_in_current_model) > 0:
+            print("\n[First 30 checkpoint params not in current detent model]")
+            for k in missing_in_current_model[:30]:
+                print("  ", k)
+
+        if len(shape_mismatch) > 0:
+            print("\n[First 30 shape mismatch params]")
+            for k, ckpt_shape, model_shape in shape_mismatch[:30]:
+                print(f"  {k}: ckpt={ckpt_shape}, detent model={model_shape}")
+
+        if len(not_loaded) > 0:
+            print("\n[First 30 current detent model params not loaded]")
+            for k in not_loaded[:30]:
+                print("  ", k)
+
+    # module.eval()
+    print("load detnet finished")
+    return module
+
+
+def save_flatten_csv(file_path, frame_ids, data_array, prefix):
+    """
+    将任意[T, ...]的数组拉平成二维后保存为 csv
+    第一列为 frame_id
+    """
+    data_array = np.asarray(data_array)
+    if data_array.ndim < 2:
+        data_array = data_array.reshape(len(frame_ids), 1)
+
+    flat_array = data_array.reshape(data_array.shape[0], -1)
+
+    headers = ['frame_id']
+    for i in range(flat_array.shape[1]):
+        headers.append(f'{prefix}_{i}')
+
+    with open(file_path, 'w', newline='') as f_csv:
+        writer = csv.writer(f_csv)
+        writer.writerow(headers)
+        for idx, row in zip(frame_ids, flat_array):
+            writer.writerow([idx] + row.tolist())
+
+
+def save_joint_var_metrics(save_dir, raw_joints_array):
+    """
+    raw_joints_array: [T, 21, 3]
+    保存：
+    1) 每个关节、每个坐标轴的方差 [21, 3]
+    2) 每个关节的整体方差（对3个axis求均值）[21]
+    3) 全局整体方差 scalar
+    """
+    var_per_joint_per_axis = np.var(raw_joints_array, axis=0)   # [21, 3]
+    var_per_joint = np.mean(var_per_joint_per_axis, axis=1)     # [21]
+    overall_var = np.var(raw_joints_array)
+
+    np.savez(
+        os.path.join(save_dir, 'joints_var_metrics.npz'),
+        var_per_joint_per_axis=var_per_joint_per_axis,
+        var_per_joint=var_per_joint,
+        overall_var=overall_var
+    )
+
+    # 保存每个关节每个坐标轴的方差
+    with open(os.path.join(save_dir, 'joints_var_per_joint_per_axis.csv'), 'w', newline='') as f_csv:
+        writer = csv.writer(f_csv)
+        writer.writerow(['joint_id', 'var_x', 'var_y', 'var_z'])
+        for joint_id in range(var_per_joint_per_axis.shape[0]):
+            writer.writerow([
+                joint_id,
+                var_per_joint_per_axis[joint_id, 0],
+                var_per_joint_per_axis[joint_id, 1],
+                var_per_joint_per_axis[joint_id, 2]
+            ])
+
+    # 保存每个关节整体方差
+    with open(os.path.join(save_dir, 'joints_var_per_joint.csv'), 'w', newline='') as f_csv:
+        writer = csv.writer(f_csv)
+        writer.writerow(['joint_id', 'var_mean_xyz'])
+        for joint_id in range(var_per_joint.shape[0]):
+            writer.writerow([joint_id, var_per_joint[joint_id]])
+
+    summary = {
+        'num_frames': int(raw_joints_array.shape[0]),
+        'num_joints': int(raw_joints_array.shape[1]),
+        'coord_dim': int(raw_joints_array.shape[2]),
+        'overall_var': float(overall_var)
+    }
+    with open(os.path.join(save_dir, 'joints_var_summary.json'), 'w') as f_json:
+        json.dump(summary, f_json, indent=4)
+
+module = load_detnet_checkpoint_auto(
+    config_json_path=CONFIG_JSON_PATH,
+    ckpt_path=CKPT_PATH,
+    device=device,
+    strict=True
+)
+
+print('After loading detnet, load shapenet:')
 
 shape_model = shape_net.ShapeNet()
 shape_net.load_checkpoint(
@@ -124,74 +312,6 @@ all_pose_R = []             # 每帧rotmat姿态
 all_j3d_recon = []          # 每帧Mano重建后的21关节坐标
 all_uv = []                 # 每帧uv
 
-def save_flatten_csv(file_path, frame_ids, data_array, prefix):
-    """
-    将任意[T, ...]的数组拉平成二维后保存为 csv
-    第一列为 frame_id
-    """
-    data_array = np.asarray(data_array)
-    if data_array.ndim < 2:
-        data_array = data_array.reshape(len(frame_ids), 1)
-
-    flat_array = data_array.reshape(data_array.shape[0], -1)
-
-    headers = ['frame_id']
-    for i in range(flat_array.shape[1]):
-        headers.append(f'{prefix}_{i}')
-
-    with open(file_path, 'w', newline='') as f_csv:
-        writer = csv.writer(f_csv)
-        writer.writerow(headers)
-        for idx, row in zip(frame_ids, flat_array):
-            writer.writerow([idx] + row.tolist())
-
-
-def save_joint_var_metrics(save_dir, raw_joints_array):
-    """
-    raw_joints_array: [T, 21, 3]
-    保存：
-    1) 每个关节、每个坐标轴的方差 [21, 3]
-    2) 每个关节的整体方差（对3个axis求均值）[21]
-    3) 全局整体方差 scalar
-    """
-    var_per_joint_per_axis = np.var(raw_joints_array, axis=0)   # [21, 3]
-    var_per_joint = np.mean(var_per_joint_per_axis, axis=1)     # [21]
-    overall_var = np.var(raw_joints_array)
-
-    np.savez(
-        os.path.join(save_dir, 'joints_var_metrics.npz'),
-        var_per_joint_per_axis=var_per_joint_per_axis,
-        var_per_joint=var_per_joint,
-        overall_var=overall_var
-    )
-
-    # 保存每个关节每个坐标轴的方差
-    with open(os.path.join(save_dir, 'joints_var_per_joint_per_axis.csv'), 'w', newline='') as f_csv:
-        writer = csv.writer(f_csv)
-        writer.writerow(['joint_id', 'var_x', 'var_y', 'var_z'])
-        for joint_id in range(var_per_joint_per_axis.shape[0]):
-            writer.writerow([
-                joint_id,
-                var_per_joint_per_axis[joint_id, 0],
-                var_per_joint_per_axis[joint_id, 1],
-                var_per_joint_per_axis[joint_id, 2]
-            ])
-
-    # 保存每个关节整体方差
-    with open(os.path.join(save_dir, 'joints_var_per_joint.csv'), 'w', newline='') as f_csv:
-        writer = csv.writer(f_csv)
-        writer.writerow(['joint_id', 'var_mean_xyz'])
-        for joint_id in range(var_per_joint.shape[0]):
-            writer.writerow([joint_id, var_per_joint[joint_id]])
-
-    summary = {
-        'num_frames': int(raw_joints_array.shape[0]),
-        'num_joints': int(raw_joints_array.shape[1]),
-        'coord_dim': int(raw_joints_array.shape[2]),
-        'overall_var': float(overall_var)
-    }
-    with open(os.path.join(save_dir, 'joints_var_summary.json'), 'w') as f_json:
-        json.dump(summary, f_json, indent=4)
 
 while (cap.isOpened()):
     ret_flag, img = cap.read()
